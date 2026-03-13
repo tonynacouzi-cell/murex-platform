@@ -186,7 +186,7 @@ class SurveyResponse(Base):
     csat_score: Mapped[Optional[float]] = mapped_column(Float)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
     ip_address: Mapped[Optional[str]]  = mapped_column(String(50))
-    metadata: Mapped[Optional[dict]]   = mapped_column(JSON)
+    extra_data: Mapped[Optional[dict]]   = mapped_column(JSON)
     submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime]  = mapped_column(DateTime(timezone=True), default=now_utc)
 
