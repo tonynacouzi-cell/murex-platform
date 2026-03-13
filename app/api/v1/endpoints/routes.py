@@ -31,7 +31,7 @@ from app.schemas.schemas import (
 )
 from app.core.config import settings
 from app.tasks.tasks import (
-    send_survey_email, send_survey_sms, send_whatsapp,
+    send_survey_email, send_survey_sms,
     score_ms_submission, transcribe_media, generate_nps_report,
     export_to_excel, export_to_pptx,
 )
@@ -262,7 +262,7 @@ async def distribute_survey(
         elif payload.channel == DistributionChannel.SMS and dist.recipient_phone:
             send_survey_sms.delay(dist.id)
         elif payload.channel == DistributionChannel.WHATSAPP and dist.recipient_phone:
-            send_whatsapp.delay(dist.recipient_phone, f"Survey link: https://s.murex.io/{token}")
+            send_survey_sms.delay(dist.id)  # fallback to SMS for WhatsApp channel
 
         created.append({"token": token, "channel": payload.channel})
 
@@ -542,27 +542,28 @@ async def upload_media(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    import boto3
     import mimetypes
-
+    import cloudinary
+    import cloudinary.uploader
+    cloudinary.config(
+        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+        api_key=settings.CLOUDINARY_API_KEY,
+        api_secret=settings.CLOUDINARY_API_SECRET,
+        secure=True,
+    )
     allowed = {"audio/mpeg", "audio/wav", "audio/mp4", "video/mp4", "video/quicktime", "audio/x-m4a"}
     mime = file.content_type or mimetypes.guess_type(file.filename)[0]
     if mime not in allowed:
         raise HTTPException(status_code=415, detail=f"Unsupported file type: {mime}")
-
     file_type = "audio" if mime.startswith("audio") else "video"
-    s3_key = f"qualitative/{current_user.id}/{secrets.token_hex(8)}/{file.filename}"
-
-    # Upload to S3
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-        region_name=settings.AWS_REGION,
-        endpoint_url=settings.S3_ENDPOINT_URL or None,
-    )
     content = await file.read()
-    s3.put_object(Bucket=settings.S3_BUCKET_NAME, Key=s3_key, Body=content, ContentType=mime)
+    upload_result = cloudinary.uploader.upload(
+        content,
+        folder=f"murex/qualitative/{current_user.id}",
+        resource_type="auto",
+        public_id=f"{secrets.token_hex(8)}_{file.filename}",
+    )
+    s3_key = upload_result["secure_url"]
 
     media = MediaFile(
         uploaded_by_id=current_user.id,
