@@ -294,7 +294,7 @@ async def submit_response(
         is_complete=True,
         nps_score=nps_score,
         duration_seconds=payload.duration_seconds,
-        metadata=payload.metadata,
+        extra_data=payload.metadata,
         submitted_at=datetime.now(timezone.utc),
     )
     db.add(response)
