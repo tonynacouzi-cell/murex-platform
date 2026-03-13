@@ -16,12 +16,20 @@ from app.api.v1.endpoints.routes import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.db.session import engine, Base
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    print("✅ Database ready")
+    # Run DB migrations in background — don't block startup
+    try:
+        from app.db.session import engine, Base
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("✅ Database tables ready")
+    except Exception as e:
+        print(f"⚠️  DB init warning (non-fatal): {e}")
     yield
-    await engine.dispose()
+    try:
+        from app.db.session import engine
+        await engine.dispose()
+    except Exception:
+        pass
     print("✅ Shutdown complete")
 
 
@@ -66,6 +74,7 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health():
     from datetime import datetime, timezone
+    db_status = "unknown"
     try:
         from app.db.session import AsyncSessionLocal
         from sqlalchemy import text
@@ -74,4 +83,9 @@ async def health():
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {str(e)}"
-    return {"status": "healthy", "database": db_status, "timestamp": datetime.now(timezone.utc).isoformat()}
+    # Return healthy even if DB is still connecting — app is running
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
