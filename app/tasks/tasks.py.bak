@@ -1,0 +1,568 @@
+"""
+Celery tasks — async jobs for all three modules
+"""
+
+import os
+import json
+import logging
+from celery import Celery
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+celery_app = Celery(
+    "murex",
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    timezone="UTC",
+    enable_utc=True,
+    task_track_started=True,
+    task_acks_late=True,
+    worker_prefetch_multiplier=1,
+    task_routes={
+        "app.tasks.tasks.send_survey_email":    {"queue": "notifications"},
+        "app.tasks.tasks.send_survey_sms":      {"queue": "notifications"},
+        "app.tasks.tasks.send_whatsapp":        {"queue": "notifications"},
+        "app.tasks.tasks.transcribe_media":     {"queue": "ai"},
+        "app.tasks.tasks.analyze_sentiment":    {"queue": "ai"},
+        "app.tasks.tasks.score_ms_submission":  {"queue": "scoring"},
+        "app.tasks.tasks.generate_nps_report":  {"queue": "reports"},
+        "app.tasks.tasks.export_to_excel":      {"queue": "reports"},
+        "app.tasks.tasks.export_to_pptx":       {"queue": "reports"},
+    },
+    beat_schedule={
+        "close-expired-surveys": {
+            "task": "app.tasks.tasks.close_expired_surveys",
+            "schedule": 3600.0,   # every hour
+        },
+        "send-assignment-reminders": {
+            "task": "app.tasks.tasks.send_assignment_reminders",
+            "schedule": 86400.0,  # every 24 hours
+        },
+    },
+)
+
+
+# ─────────────────────────────────────────────
+# MODULE A — SURVEY NOTIFICATIONS
+# ─────────────────────────────────────────────
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def send_survey_email(self, distribution_id: int):
+    """Send survey invite via email (SendGrid)."""
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+        from app.db.session import AsyncSessionLocal
+        import asyncio
+
+        async def _send():
+            async with AsyncSessionLocal() as db:
+                from sqlalchemy import select
+                from app.models.models import Distribution, Survey
+                result = await db.execute(
+                    select(Distribution).where(Distribution.id == distribution_id)
+                )
+                dist = result.scalar_one_or_none()
+                if not dist or dist.is_sent:
+                    return
+
+                survey_result = await db.execute(select(Survey).where(Survey.id == dist.survey_id))
+                survey = survey_result.scalar_one_or_none()
+
+                survey_url = f"https://survey.murexinsights.com/s/{dist.token}"
+                message = Mail(
+                    from_email=settings.SENDGRID_FROM_EMAIL,
+                    to_emails=dist.recipient_email,
+                    subject=f"You're invited: {survey.title}",
+                    html_content=f"""
+                        <h2>{survey.title}</h2>
+                        <p>Please take a moment to complete our survey.</p>
+                        <a href="{survey_url}" style="background:#2563eb;color:#fff;padding:12px 24px;
+                           border-radius:6px;text-decoration:none">Start Survey</a>
+                        <p style="color:#999;font-size:12px">This link is unique to you.</p>
+                    """,
+                )
+                sg = SendGridAPIClient(settings.SENDGRID_API_KEY)
+                sg.send(message)
+
+                from datetime import datetime, timezone
+                dist.is_sent = True
+                dist.sent_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.info(f"Survey email sent for distribution {distribution_id}")
+
+        asyncio.get_event_loop().run_until_complete(_send())
+
+    except Exception as exc:
+        logger.error(f"Failed to send email for distribution {distribution_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def send_survey_sms(self, distribution_id: int):
+    """Send survey invite via SMS (Twilio)."""
+    try:
+        from twilio.rest import Client
+
+        async def _send():
+            from app.db.session import AsyncSessionLocal
+            from sqlalchemy import select
+            from app.models.models import Distribution
+            import asyncio
+
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(Distribution).where(Distribution.id == distribution_id))
+                dist = result.scalar_one_or_none()
+                if not dist or dist.is_sent or not dist.recipient_phone:
+                    return
+
+                survey_url = f"https://s.murex.io/{dist.token}"
+                client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+                client.messages.create(
+                    body=f"You're invited to share your feedback. Complete our survey: {survey_url}",
+                    from_=settings.TWILIO_FROM_NUMBER,
+                    to=dist.recipient_phone,
+                )
+                from datetime import datetime, timezone
+                dist.is_sent = True
+                dist.sent_at = datetime.now(timezone.utc)
+                await db.commit()
+
+        import asyncio
+        asyncio.get_event_loop().run_until_complete(_send())
+
+    except Exception as exc:
+        logger.error(f"SMS send failed for distribution {distribution_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task
+def send_whatsapp(phone: str, message: str, media_url: str = None):
+    """Send WhatsApp message via Twilio."""
+    try:
+        from twilio.rest import Client
+        client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+        msg_params = {
+            "from_": f"whatsapp:{settings.TWILIO_FROM_NUMBER}",
+            "to": f"whatsapp:{phone}",
+            "body": message,
+        }
+        if media_url:
+            msg_params["media_url"] = [media_url]
+        client.messages.create(**msg_params)
+        logger.info(f"WhatsApp sent to {phone}")
+    except Exception as e:
+        logger.error(f"WhatsApp failed: {e}")
+        raise
+
+
+@celery_app.task
+def close_expired_surveys():
+    """Periodic: close surveys that have passed their end_date."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    async def _close():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select, update
+        from app.models.models import Survey, SurveyStatus
+
+        async with AsyncSessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            await db.execute(
+                update(Survey)
+                .where(Survey.end_date < now, Survey.status == SurveyStatus.ACTIVE)
+                .values(status=SurveyStatus.CLOSED)
+            )
+            await db.commit()
+            logger.info("Expired surveys closed.")
+
+    asyncio.get_event_loop().run_until_complete(_close())
+
+
+# ─────────────────────────────────────────────
+# MODULE B — MYSTERY SHOPPING
+# ─────────────────────────────────────────────
+
+@celery_app.task(bind=True, max_retries=2)
+def score_ms_submission(self, submission_id: int):
+    """Auto-score a mystery shopping submission based on form weights."""
+    import asyncio
+
+    async def _score():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select
+        from app.models.models import MSSubmission, AuditForm
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(MSSubmission).where(MSSubmission.id == submission_id))
+            sub = result.scalar_one_or_none()
+            if not sub:
+                return
+
+            form_result = await db.execute(select(AuditForm).where(AuditForm.id == sub.form_id))
+            form = form_result.scalar_one_or_none()
+            if not form or not form.sections:
+                return
+
+            total_score = 0.0
+            max_score = 0.0
+
+            for section in form.sections:
+                for q in section.get("questions", []):
+                    q_id = str(q["id"])
+                    weight = float(q.get("weight", 1.0))
+                    max_score += weight
+                    answer = sub.answers.get(q_id)
+                    if answer is not None:
+                        if q["type"] == "boolean":
+                            total_score += weight if answer is True else 0
+                        elif q["type"] == "rating":
+                            max_val = q.get("max", 5)
+                            total_score += (float(answer) / max_val) * weight
+
+            sub.score = round((total_score / max_score) * 100, 2) if max_score > 0 else 0
+            sub.qa_status = "auto_scored"
+            await db.commit()
+            logger.info(f"Submission {submission_id} scored: {sub.score}")
+
+    asyncio.get_event_loop().run_until_complete(_score())
+
+
+@celery_app.task
+def send_assignment_reminders():
+    """Daily: remind shoppers of upcoming due assignments."""
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+
+    async def _remind():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select
+        from app.models.models import MSAssignment, TaskStatus, ShopperProfile, User
+
+        async with AsyncSessionLocal() as db:
+            tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+            result = await db.execute(
+                select(MSAssignment)
+                .where(
+                    MSAssignment.due_date <= tomorrow,
+                    MSAssignment.status == TaskStatus.ASSIGNED,
+                )
+            )
+            assignments = result.scalars().all()
+            for a in assignments:
+                if a.shopper_id:
+                    send_survey_sms.delay(a.shopper_id)
+                    logger.info(f"Reminder sent for assignment {a.id}")
+
+    asyncio.get_event_loop().run_until_complete(_remind())
+
+
+# ─────────────────────────────────────────────
+# MODULE C — AI MEDIA PROCESSING
+# ─────────────────────────────────────────────
+
+@celery_app.task(bind=True, max_retries=2, time_limit=3600)
+def transcribe_media(self, media_file_id: int):
+    """
+    Download from S3, transcribe with Whisper, store segments.
+    Supports Arabic and other GCC languages.
+    """
+    import asyncio
+    import tempfile
+    import boto3
+
+    async def _transcribe():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select
+        from app.models.models import MediaFile, Transcript, MediaStatus
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(MediaFile).where(MediaFile.id == media_file_id))
+            mf = result.scalar_one_or_none()
+            if not mf:
+                return
+
+            mf.status = MediaStatus.PROCESSING
+            await db.commit()
+
+            try:
+                # Download from S3
+                s3 = boto3.client(
+                    "s3",
+                    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                    region_name=settings.AWS_REGION,
+                    endpoint_url=settings.S3_ENDPOINT_URL or None,
+                )
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                    s3.download_fileobj(settings.S3_BUCKET_NAME, mf.s3_key, tmp)
+                    tmp_path = tmp.name
+
+                # Transcribe with Whisper
+                import whisper
+                model = whisper.load_model("medium")
+                whisper_result = model.transcribe(
+                    tmp_path,
+                    language=mf.language if mf.language != "auto" else None,
+                    task="transcribe",
+                    verbose=False,
+                )
+
+                segments = [
+                    {
+                        "start": s["start"],
+                        "end": s["end"],
+                        "text": s["text"].strip(),
+                        "speaker": None,  # populated by diarization task
+                    }
+                    for s in whisper_result["segments"]
+                ]
+
+                transcript = Transcript(
+                    media_file_id=mf.id,
+                    full_text=whisper_result["text"],
+                    segments=segments,
+                    language_detected=whisper_result.get("language", mf.language),
+                )
+                db.add(transcript)
+                mf.status = MediaStatus.TRANSCRIBED
+                await db.commit()
+                await db.refresh(transcript)
+
+                # Chain sentiment analysis
+                analyze_sentiment.delay(media_file_id)
+                logger.info(f"Transcription complete for media {media_file_id}")
+
+                # Cleanup temp file
+                os.unlink(tmp_path)
+
+            except Exception as e:
+                mf.status = MediaStatus.FAILED
+                await db.commit()
+                raise e
+
+    asyncio.get_event_loop().run_until_complete(_transcribe())
+
+
+@celery_app.task(bind=True, max_retries=2)
+def analyze_sentiment(self, media_file_id: int):
+    """
+    Run Arabic/English sentiment + keyword extraction on transcript.
+    Uses HuggingFace CAMeLBERT for Arabic, multilingual BERT for others.
+    """
+    import asyncio
+
+    async def _analyze():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select
+        from app.models.models import MediaFile, Transcript, QualAnalysis, MediaStatus
+
+        async with AsyncSessionLocal() as db:
+            mf_result  = await db.execute(select(MediaFile).where(MediaFile.id == media_file_id))
+            tr_result  = await db.execute(select(Transcript).where(Transcript.media_file_id == media_file_id))
+            mf = mf_result.scalar_one_or_none()
+            tr = tr_result.scalar_one_or_none()
+
+            if not mf or not tr or not tr.full_text:
+                return
+
+            try:
+                from transformers import pipeline
+
+                # Select model based on language
+                if mf.language in ("ar", "arabic"):
+                    model_name = "CAMeL-Lab/bert-base-arabic-camelbert-mix-sentiment"
+                else:
+                    model_name = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+
+                sentiment_pipeline = pipeline(
+                    "sentiment-analysis",
+                    model=model_name,
+                    tokenizer=model_name,
+                    truncation=True,
+                    max_length=512,
+                )
+
+                # Chunk text into 512-token segments for analysis
+                chunk_size = 400
+                words = tr.full_text.split()
+                chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+
+                sentiments = []
+                for chunk in chunks[:10]:  # max 10 chunks
+                    if chunk.strip():
+                        res = sentiment_pipeline(chunk)[0]
+                        sentiments.append({"label": res["label"], "score": res["score"]})
+
+                # Aggregate
+                pos = sum(1 for s in sentiments if "pos" in s["label"].lower())
+                neg = sum(1 for s in sentiments if "neg" in s["label"].lower())
+                overall = "positive" if pos > neg else "negative" if neg > pos else "neutral"
+                avg_score = sum(s["score"] for s in sentiments) / len(sentiments) if sentiments else 0.5
+
+                # Keyword extraction (simple frequency approach)
+                import re
+                from collections import Counter
+                stop_words = {"the","a","an","and","or","but","in","on","at","to","for","of","is","are","was"}
+                words_clean = re.findall(r'\b[a-zA-Z\u0600-\u06FF]{3,}\b', tr.full_text.lower())
+                filtered = [w for w in words_clean if w not in stop_words]
+                keyword_counts = Counter(filtered).most_common(20)
+                keywords = [{"word": k, "count": v} for k, v in keyword_counts]
+
+                analysis = QualAnalysis(
+                    media_file_id=mf.id,
+                    overall_sentiment=overall,
+                    sentiment_score=round(avg_score, 4),
+                    keywords=keywords,
+                    topics=[],
+                    sentiment_timeline=sentiments,
+                    summary=f"Overall sentiment: {overall}. Analyzed {len(chunks)} segments.",
+                )
+                db.add(analysis)
+                mf.status = MediaStatus.ANALYZED
+                await db.commit()
+                logger.info(f"Sentiment analysis complete for media {media_file_id}")
+
+            except Exception as e:
+                logger.error(f"Sentiment analysis failed for media {media_file_id}: {e}")
+                raise e
+
+    asyncio.get_event_loop().run_until_complete(_analyze())
+
+
+# ─────────────────────────────────────────────
+# REPORTING TASKS
+# ─────────────────────────────────────────────
+
+@celery_app.task
+def generate_nps_report(survey_id: int) -> dict:
+    """Calculate NPS, CSAT, completion rate for a survey."""
+    import asyncio
+
+    async def _calc():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select, func
+        from app.models.models import SurveyResponse
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(SurveyResponse).where(
+                    SurveyResponse.survey_id == survey_id,
+                    SurveyResponse.is_complete == True,
+                )
+            )
+            responses = result.scalars().all()
+
+            if not responses:
+                return {"survey_id": survey_id, "total_responses": 0, "nps_score": None}
+
+            nps_scores = [r.nps_score for r in responses if r.nps_score is not None]
+            promoters  = sum(1 for s in nps_scores if s >= 9)
+            passives   = sum(1 for s in nps_scores if 7 <= s <= 8)
+            detractors = sum(1 for s in nps_scores if s <= 6)
+            total_nps  = len(nps_scores)
+
+            nps = round(((promoters - detractors) / total_nps) * 100, 1) if total_nps else 0
+
+            csat_scores = [r.csat_score for r in responses if r.csat_score is not None]
+            avg_csat = round(sum(csat_scores) / len(csat_scores), 2) if csat_scores else None
+
+            return {
+                "survey_id": survey_id,
+                "total_responses": len(responses),
+                "promoters": promoters,
+                "passives": passives,
+                "detractors": detractors,
+                "nps_score": nps,
+                "avg_csat": avg_csat,
+            }
+
+    return asyncio.get_event_loop().run_until_complete(_calc())
+
+
+@celery_app.task
+def export_to_excel(survey_id: int, output_path: str):
+    """Export survey responses to Excel with per-question sheets."""
+    import asyncio
+    import pandas as pd
+
+    async def _export():
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy import select
+        from app.models.models import SurveyResponse, Answer, Question
+
+        async with AsyncSessionLocal() as db:
+            resp_result = await db.execute(
+                select(SurveyResponse).where(SurveyResponse.survey_id == survey_id)
+            )
+            responses = resp_result.scalars().all()
+
+            rows = []
+            for r in responses:
+                ans_result = await db.execute(select(Answer).where(Answer.response_id == r.id))
+                answers = ans_result.scalars().all()
+                row = {
+                    "response_id": r.id,
+                    "submitted_at": r.submitted_at,
+                    "is_complete": r.is_complete,
+                    "nps_score": r.nps_score,
+                    "csat_score": r.csat_score,
+                }
+                for a in answers:
+                    row[f"q_{a.question_id}"] = a.value_text or a.value_numeric or str(a.value_choices or "")
+                rows.append(row)
+
+            df = pd.DataFrame(rows)
+            with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Responses", index=False)
+
+            logger.info(f"Excel exported: {output_path}")
+            return output_path
+
+    return asyncio.get_event_loop().run_until_complete(_export())
+
+
+@celery_app.task
+def export_to_pptx(survey_id: int, output_path: str):
+    """Generate a PowerPoint summary report from NPS data."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+
+    nps_data = generate_nps_report(survey_id)
+
+    prs = Presentation()
+    slide_layout = prs.slide_layouts[5]
+
+    # Title slide
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = "Survey Report"
+    slide.placeholders[1].text = f"Survey ID: {survey_id}"
+
+    # NPS Summary slide
+    slide2 = prs.slides.add_slide(slide_layout)
+    tf = slide2.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(5))
+    frame = tf.text_frame
+    frame.word_wrap = True
+
+    p = frame.add_paragraph()
+    p.text = f"NPS Score: {nps_data.get('nps_score', 'N/A')}"
+    p.font.size = Pt(32)
+    p.font.bold = True
+
+    for key in ("total_responses", "promoters", "passives", "detractors", "avg_csat"):
+        p2 = frame.add_paragraph()
+        p2.text = f"{key.replace('_', ' ').title()}: {nps_data.get(key, 'N/A')}"
+        p2.font.size = Pt(18)
+
+    prs.save(output_path)
+    logger.info(f"PPTX exported: {output_path}")
+    return output_path
