@@ -26,12 +26,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # AWS / MinIO
-    AWS_ACCESS_KEY_ID: str = ""
-    AWS_SECRET_ACCESS_KEY: str = ""
-    AWS_REGION: str = "me-south-1"
-    S3_BUCKET_NAME: str = "murex-media"
-    S3_ENDPOINT_URL: str = ""
+    # Cloudinary (replaces S3/MinIO for Railway deployment)
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
 
     # Notifications
     SENDGRID_API_KEY: str = ""
